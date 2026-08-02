@@ -1,0 +1,185 @@
+import pandas as pd
+import os
+import json
+import re
+
+
+def extract_appraisals(app_text):
+    """
+    壊れた JSON 風の appraisals ブロックから
+    key:value をすべて抽出して dict にする
+    """
+    pattern = r'"(.*?)"\s*:\s*([0-9]+)'
+    matches = re.findall(pattern, app_text)
+
+    return {key: int(value) for key, value in matches}
+
+
+def extract_parts_from_broken_json(raw_path):
+    """
+    壊れた JSON 風テキストから
+    emotions, appraisals, reason を安全に抽出する
+    """
+    
+    """raw.txt の中から JSON 部分だけを抽出して dict で返す"""
+    with open(raw_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # --- emotions ---
+    emo_pattern = r'"emotions"\s*:\s*\[(.*?)\]'
+    emo_match = re.search(emo_pattern, text, re.DOTALL)
+    if emo_match:
+        emo_raw = "[" + emo_match.group(1) + "]"
+        emotions = json.loads(emo_raw)
+    else:
+        emotions = []
+
+    # --- appraisals ---
+    app_pattern = r'"appraisals"\s*:\s*\{(.*?)\}'
+    app_match = re.search(app_pattern, text, re.DOTALL)
+    if app_match:
+        app_raw = "{" + app_match.group(1) + "}"
+        appraisals = extract_appraisals(app_raw)
+    else:
+        appraisals = {}
+
+    # --- reason ---
+    pattern = r'"reason"\s*:\s*"(.*?)"'
+    reason_match = re.search(pattern, text, re.DOTALL)
+    if reason_match:
+        reason = reason_match.group(1)
+    else:
+        reason = ""
+
+    return emotions, appraisals, reason
+
+error_dir = "./モデル別ファイル/論文用/json_parse_errors"
+
+
+def extract_emotions(text):
+    pattern = r'"emotions"\s*:\s*\[(.*?)\]'
+    m = re.search(pattern, text, re.DOTALL)
+    if not m:
+        return []
+    raw = "[" + m.group(1) + "]"
+    return [e.strip().strip('"') for e in raw.strip("[]").split(",")]
+
+
+def extract_appraisals(text):
+    pattern = r'"appraisals"\s*:\s*\{(.*?)\}'
+    m = re.search(pattern, text, re.DOTALL)
+    if not m:
+        return {}
+    block = m.group(1)
+    kv_pattern = r'"(.*?)"\s*:\s*([0-9]+)'
+    return {k: int(v) for k, v in re.findall(kv_pattern, block)}
+
+
+# --- reason の JSON ブロックを正しく抽出する関数 ---
+def extract_reason_block(text):
+    """
+    "reason": {...} の中身を dict として返す
+    """
+    pattern = r'"reason"\s*:\s*\{(.*?)\}'
+    m = re.search(pattern, text, re.DOTALL)
+    if not m:
+        return {}
+
+    block = "{" + m.group(1) + "}"
+
+    # JSON として壊れている可能性があるので修正
+    block = block.replace("\n", " ")
+    block = re.sub(r',\s*}', '}', block)
+
+    try:
+        return json.loads(block)
+    except:
+        return {}
+
+
+def save_reason_csv(
+    model, vid_idx, reason_obj): 
+    """ reason の JSON を 行＝word1, word2, reason1, reason2... 列＝video_id のワイド形式で保存する。 """
+
+    base_dir = "./モデル別ファイル/論文用/reason_csv"
+    os.makedirs(base_dir, exist_ok=True)
+
+    csv_path = os.path.join(base_dir, f"02_{model}_FRAMES_reason.csv")
+
+    # JSON から抽出
+    top_words = reason_obj.get("top_emotion_words", [])
+    causes = reason_obj.get("causes", [])
+
+    # ラベル付きで並べる
+    rows = {}
+    for i, w in enumerate(top_words, start=1):
+        rows[f"word{i}"] = w
+    for i, c in enumerate(causes, start=1):
+        rows[f"reason{i}"] = c
+
+    # 既存 CSV があれば読み込む
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path, index_col=0, encoding="utf-8")
+    else:
+        df = pd.DataFrame()
+
+    col = str(vid_idx)
+
+    # 新しい列がなければ追加
+    if col not in df.columns:
+        df[col] = ""
+
+    # 行を追加または更新
+    for row_label, text in rows.items():
+        df.loc[row_label, col] = text
+
+    # 保存
+    df.to_csv(csv_path, encoding="utf-8")
+
+    return top_words, causes
+
+# ---------------------------------------------------------
+# ここから全ファイル処理
+# ---------------------------------------------------------
+
+
+for filename in os.listdir(error_dir):
+    if not filename.endswith("raw.txt"):
+        continue
+
+    raw_path = os.path.join(error_dir, filename)
+
+    parts = filename.split("_")
+    vid_idx = parts[0]
+    model = parts[1]
+    inputting = parts[2]
+
+    file_path_json_1 = f"./モデル別ファイル/論文用/{model}/1227_{model}_{inputting}_1.csv"
+    file_path_json_3 = f"./モデル別ファイル/論文用/{model}/1227_{model}_{inputting}_3.csv"
+
+    with open(raw_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    emotions = extract_emotions(text)
+    appraisals = extract_appraisals(text)
+    reason_block = extract_reason_block(text)
+
+    # --- emotions 書き込み ---
+    df1 = pd.read_csv(file_path_json_1, index_col=0)
+    score_map = {0: 50, 1: 10, 2: 1}
+    for i, emo in enumerate(emotions):
+        if emo in df1.index:
+            df1.loc[emo, vid_idx] = score_map.get(i, 0)
+    df1.to_csv(file_path_json_1)
+
+    # --- appraisals 書き込み ---
+    df3 = pd.read_csv(file_path_json_3, index_col=0)
+    for key, value in appraisals.items():
+        if key in df3.index:
+            df3.loc[key, vid_idx] = value
+    df3.to_csv(file_path_json_3)
+
+    # --- reason をワイド形式 CSV に保存 ---
+    save_reason_csv(model, vid_idx, reason_block)
+
+    print(f"Processed: {filename}")
