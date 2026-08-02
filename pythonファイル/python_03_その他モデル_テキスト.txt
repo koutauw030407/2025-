@@ -1,0 +1,800 @@
+import glob
+from typing import Optional
+import re
+import pandas as pd
+import json
+import requests
+import os
+import logging
+from datetime import datetime
+from typing import List, Tuple
+import traceback
+import sys
+
+# こちらのファイルをpythonファイルとして、Visual Studio Codeを用いて実行しました。
+
+# 1. パラメータ調整欄
+Day = "1227"
+temperature = 0
+NUM_START = 1
+NUM_VIDS = 2185
+
+# 2. APIキーなど、LLM関係の設定
+# APIキーは、この実験では大学から支給されたものを使用いたしました。
+API_KEY = ""
+headers = {"Authorization": f"Bearer {API_KEY}",
+           "Content-Type": "application/json"}
+
+MODELS_OTHERS = ["gpt-4o",  "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
+                 "gpt-4.1-nano", "gpt-4-turbo", "gpt-4",  "gpt-3.5-turbo"]
+
+# 4.  エラー発生場所
+error_log = []
+
+
+# 5. 感情カテゴリ / 単語 / 14次元
+EMOTIONS = [
+    "Admiration", "Adoration", "Aesthetic-Appreciation", "Amusement", "Anger", "Anxiety",
+    "Awe", "Awkwardness", "Boredom", "Calmness", "Confusion", "Contempt", "Craving",
+    "Disappointment", "Disgust", "Empathic-Pain", "Entrancement", "Envy", "Excitement",
+    "Fear", "Guilt", "Horror", "Interest", "Joy", "Nostalgia", "Pride", "Relief", "Romance",
+    "Sadness", "Satisfaction", "Sexual-Desire", "Surprise", "Sympathy", "Triumph"
+]
+
+
+# 14種類の状況を9段階評価
+APPRAISALS = ["approach", "arousal", "attention", "certainty", "commitment", "control", "dominance",
+              "effort", "fairness", "identity", "obstruction", "safety", "upswing", "valence"]
+
+
+# 6. 点数の付け方：1位を50点、2位を10点、3位を1点
+system_prompt0 = """
+                You are a participant in an experiment in which participants watch a video.
+        Input:
+        - The description of a video (text (and frames)).
+        Task:
+        1. Of the 34 predefined emotions, output 3 emotions a common person would feel when watching the entire video, in order of strength.
+        2. Additionally, output the scores of the 14 predefined appraisal dimensions (valence, arousal, dominance, etc.) as integers from 1-9.
+
+        Assessment rules:
+        - Use the perspective of a general observer, without incorporating your own subjective views or the characteristics of your hypothetical audience or assuming specific values, culture, age, gender, etc.
+        - Make mechanical judgments based on the characteristics of the stimulus (video), not your own unique response style.
+
+        Output format rules:
+        - The output MUST be a single valid JSON object.
+        - The JSON MUST include:
+        - "emotions": an array of exactly 3 strings, each chosen from the 34 predefined EMOTIONS.
+        - "appraisals": an object with the 14 predefined APPRAISALS  as keys and integer scores as values.
+        - Do NOT invent or paraphrase emotion, or appraisal names. Only use the predefined lists.
+        - Do NOT include any other text, commentary, Markdown, or keys outside the JSON object.
+
+        Output format example:
+        {
+        "emotions": [ "Fear",  "Anxiety",  "Horror"],
+        "appraisals": {
+            "valence": 3,
+            "arousal": 8,
+            "dominance": 4,
+            "certainty": 7,
+            "effort": 5,
+            "attention": 6,
+            "commitment": 2,
+            "control": 4,
+            "fairness": 3,
+            "identity": 5,
+            "obstruction": 2,
+            "safety": 6,
+            "upswing": 4,
+            "approach": 5
+        }
+        34 predefined EMOTIONS: [
+        "Admiration", "Adoration", "Aesthetic-Appreciation", "Amusement", "Anger", "Anxiety",
+        "Awe", "Awkwardness", "Boredom", "Calmness", "Confusion", "Contempt", "Craving",
+        "Disappointment", "Disgust", "Empathic-Pain", "Entrancement", "Envy", "Excitement",
+        "Fear", "Guilt", "Horror", "Interest", "Joy", "Nostalgia", "Pride", "Relief", "Romance",
+        "Sadness", "Satisfaction", "Sexual-Desire", "Surprise", "Sympathy", "Triumph"
+    ]
+        """
+SP0_INPUT_C = [{"role": "system", "content": system_prompt0.strip()}]
+SP0_INPUT_R = [{"type": "input_text", "text": system_prompt0.strip()}]
+
+functions0 = [
+    {
+        "name": "return_emotions_appraisals",
+                "description": "Return emotion and appraisal evaluations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "emotions": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": EMOTIONS
+                            }
+                        },
+                        "appraisals": {
+                            "type": "object",
+                            "properties": {
+                                "valence": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "arousal": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "dominance": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "certainty": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "effort": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "attention": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "commitment": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "control": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "fairness": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "identity": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "obstruction": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "safety": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "upswing": {"type": "integer", "minimum": 1, "maximum": 9},
+                                "approach": {"type": "integer", "minimum": 1, "maximum": 9}
+                            },
+                            "required": ["valence", "arousal", "dominance", "certainty", "effort", "attention", "commitment", "control", "fairness", "identity", "obstruction", "safety", "upswing", "approach"]
+                        }
+                    },
+                    "required": ["emotions", "appraisals"],
+                    "additionalProperties": False
+                }
+    }
+]
+
+
+def run_completions_session(session_messages, message, model, functions, function_call):
+    # 想定入力
+    # message = message1 OR message2
+    # functions = functions0
+    # function_call =  return_emotions_appraisals
+    url = "https://api.openai.com/v1/chat/completions"
+    payload_completions = {
+        "model": model,
+        "temperature": 0,  # 再現性を高めるため、temperatureは0で固定
+        "max_tokens": 800,
+        "messages": session_messages + message,
+        "functions": functions,  # functions　はcompletionsモデルでのみ動作確認
+        "function_call": {"name": function_call}
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload_completions,
+                                 timeout=(5, 360))
+        response.raise_for_status()
+
+    except requests.exceptions.ReadTimeout:
+        return "Time-Out"
+
+    except requests.exceptions.RequestException as e:
+        logging.info(model)
+        logging.warning(
+            f"⚠️ API returned a non-200 status code: {response.status_code}")
+        logging.warning("status", response.status_code)
+        logging.warning("body:", response.text[:4000])
+        if response.status_code == 429:
+            return 4290
+        else:
+            return "Not 200"
+
+    return response.json()
+
+# 8 評価対象を選別
+
+
+def normalize_col_name(x):
+    """
+    列名をどんな形式からでも「純粋な数字文字列」に正規化する。
+    """
+    if isinstance(x, int):
+        return str(x)
+
+    if not isinstance(x, str):
+        x = str(x)
+
+    # 前後の空白・タブ・不可視文字を除去
+    x = x.strip()
+
+    # BOM 除去
+    x = x.replace("\ufeff", "")
+
+    # 数字以外を除去（安全策）
+    x = "".join(ch for ch in x if ch.isdigit())
+
+    return x
+
+def needs_re_evaluation(csv_path: str, vid_idx: int) -> bool:
+    df = pd.read_csv(csv_path, index_col=0, encoding="shift_jis")
+
+    normalized_cols = {normalize_col_name(c): c for c in df.columns}
+    key = normalize_col_name(vid_idx)
+
+    if key not in normalized_cols:
+        return False
+
+    col = normalized_cols[key]
+    values = pd.to_numeric(df[col].iloc[0:34], errors="coerce").fillna(0)
+
+    s = values.sum()
+
+    # 正常パターン
+    NORMAL = {0, 50, 60, 61}
+
+    # 正常なら再評価しない
+    if s in NORMAL:
+        return False
+
+    # それ以外は異常 → 再評価
+    return True
+
+
+def reset_column(df, vid_idx):
+    col = str(vid_idx)
+    if col in df.columns:
+        df[col] = 0
+
+
+# 10.動画ごとに "未評価の model × inputting" を抽出する関数
+
+
+def get_pending_evaluations(vid_idx: int, day: str) -> List[Tuple[str, str]]:
+    EVALUATIONS: List[Tuple[str, str]] = []
+    # MODELS_RESPONSES → TEXT のみ
+    for model in MODELS_OTHERS:
+        inputting = "TEXT"
+        pattern = f"./モデル別ファイル/バックアップ/{model}/1227_{model}_{inputting}_1.csv"
+        old_files = glob.glob(pattern)
+        excel_path = old_files[0] if old_files else None
+
+        if excel_path is None:
+            EVALUATIONS.append((model, inputting))
+        else:
+            try:
+                if needs_re_evaluation(excel_path, vid_idx):
+                    EVALUATIONS.append(model)
+            except Exception as e:
+                print(f"Warning: failed to check {excel_path}: {e}")
+                EVALUATIONS.append((model, inputting))
+
+    return EVALUATIONS
+
+
+# 11. responseモデル：感情カテゴリ・次元・単語の保存用
+def extract_results_as_choice(result):
+    # Responses API の output を探す
+    outputs = result.get("output", [])
+    for item in outputs:
+        if not isinstance(item, dict):
+            continue
+
+        # content がある message ブロックを探す
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+
+        # content の中に output_text があるか探す
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "output_text":
+                text = c.get("text", "")
+                # JSON 部分だけ抽出
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1:
+                    try:
+                        return json.loads(text[start:end+1])
+                    except:
+                        return None
+
+    # 見つからなければ None
+    return None
+
+
+# 13. 単語の保存用
+
+
+def fix_broken_json_array(text):
+    """
+    途中で切れた JSON 配列を安全に修復する。
+    例: ["Abc", "Def", "Gh → ["Abc", "Def"]
+    """
+
+    # 配列の開始位置を探す
+    start = text.find("[")
+    if start == -1:
+        return []
+
+    # 配列部分を抽出
+    arr = text[start:]
+
+    # 末尾が ] で終わっていなければ閉じる
+    if not arr.strip().endswith("]"):
+        arr = arr.rstrip()  # 改行など除去
+        arr += "]"
+
+    # JSON としてパースを試みる
+    try:
+        return json.loads(arr)
+    except Exception:
+        # パース失敗 → 要素ごとに手動で修復
+        # "xxx" の形を正規表現で抽出
+        items = re.findall(r'"([^"]*)"', arr)
+
+        # 最後の要素が途中で切れている場合を除去
+        fixed = []
+        for item in items:
+            if "\n" in item or "\r" in item:
+                continue
+            fixed.append(item)
+
+        return fixed
+
+
+def repair_arguments_array(arg_str: str) -> str:
+    """
+    function_call.arguments の中の壊れた配列部分を修復する。
+    例: "calmness","clarity",,"clarity-of-spiritual-
+      → "calmness","clarity","clarity-of-spiritual-"
+    """
+
+    if not isinstance(arg_str, str):
+        return arg_str
+
+    s = arg_str.strip()
+
+    # 1) よくある壊れ方：",," → "," に修正
+    s = re.sub(r',\s*,', ',', s)
+
+    # 2) words が配列でなく文字列扱いになっている壊れ方を修正
+    #    {"words":"a","b","c"} → {"words":["a","b","c"]}
+    if '"words":"' in s and not '"words":[' in s:
+        s = s.replace('"words":"', '"words":["')
+        # 最後の " を ] に置換（壊れている場合は後で補完）
+        s = re.sub(r'"(\s*})', r'"]\1', s)
+
+    # 3) 配列の途中で切れている場合、末尾の壊れた部分を削る
+    s = re.sub(r'"([^"]*)$', r'"\1"', s)
+
+    # 4) 配列の閉じ括弧が欠けている場合に補完
+    if '"words":[' in s and not re.search(r'\]\s*}', s):
+        # words の後ろに ]} を補完
+        s = re.sub(r'\s*}$', ']}', s)
+
+    return s
+
+
+def emotion_word_appraisal(model, vid_idx, result1, df1, df3, file_path1, file_path3):
+    if model in MODELS_OTHERS:
+        choice1 = result1["choices"][0]
+        choice1 = repair_arguments_array(choice1)
+        if choice1["finish_reason"] != "stop" and choice1["finish_reason"] != "function_call" and choice1["finish_reason"] != "None":
+            logging.warning(
+                f"⚠️ {vid_idx}: response truncated, retrying")
+            logging.info(choice1)
+            return vid_idx
+        msg = choice1["message"]
+        if "function_call" in msg and msg["function_call"] is not None:
+            raw_args1 = msg["function_call"]["arguments"]
+
+            # arguments は JSON 文字列なので json.loads で読む
+            try:
+                parsed = json.loads(raw_args1)
+            except Exception:
+                error_dir = "./モデル別ファイル/論文用/json_parse_errors"
+                os.makedirs(error_dir, exist_ok=True)
+
+                # 保存ファイル名
+                filename = f"{vid_idx}_{model}_TEXT_raw.txt"
+                save_path = os.path.join(error_dir, filename)
+
+                # result1 全体を保存（壊れた JSON も含めて）
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(str(result1))
+
+                logging.error(
+                    f"JSON parse error: Saved raw response to {save_path}")
+                return None
+
+            raw_args1 = parsed
+
+        # 2. function_call がない場合（content に JSON が入るパターン）
+        else:
+            raw_args1 = extract_results_as_choice(result1)
+
+            # content が文字列なら JSON として読む
+            if isinstance(raw_args1, str):
+                try:
+                    raw_args1 = json.loads(raw_args1)
+                except Exception:
+                    error_dir = "./モデル別ファイル/論文用/json_parse_errors"
+                    os.makedirs(error_dir, exist_ok=True)
+
+                    # 保存ファイル名
+                    filename = f"{vid_idx}_{model}_TEXT_raw.txt"
+                    save_path = os.path.join(error_dir, filename)
+
+                    # result1 全体を保存（壊れた JSON も含めて）
+                    with open(save_path, "w", encoding="utf-8") as f:
+                        f.write(str(result1))
+
+                    logging.error(
+                        f"JSON parse error: Saved raw response to {save_path}")
+                    return None
+
+    else:
+        raw_args1 = extract_results_as_choice(result1)
+
+    if not raw_args1:
+        error_dir = "./モデル別ファイル/論文用/json_parse_errors"
+        os.makedirs(error_dir, exist_ok=True)
+
+        # 保存ファイル名
+        filename = f"{vid_idx}_{model}_TEXT_raw.txt"
+        save_path = os.path.join(error_dir, filename)
+
+        # result1 全体を保存（壊れた JSON も含めて）
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(str(result1))
+
+        logging.error(
+            f"JSON parse error: Saved raw response to {save_path}")
+        return None
+
+    # JSON文字列ならdictに変換
+    if isinstance(raw_args1, str):
+        raw_args1 = json.loads(raw_args1)
+
+    # emotions 部分の処理
+    if isinstance(raw_args1, list):
+        raw_args1 = raw_args1[0]
+
+    vid_col = str(vid_idx)
+    # 列が存在しなければ追加
+    if vid_col not in df1.columns:
+        df1[vid_col] = 0
+    if vid_col not in df3.columns:
+        df3[vid_col] = 1
+
+    emotions = raw_args1.get("emotions", [])
+
+    # 順位ごとの点数を定義
+    score_map = {0: 50, 1: 10, 2: 1}
+
+    # emotions の順位に応じてスコアを付与
+    # EMOTIONSにないものを"Other"に変換し、既存感情より後ろに配置
+    valid = [e for e in emotions if e in EMOTIONS]
+    if any(e not in EMOTIONS for e in emotions):
+        others = ["Other"]
+    else:
+        others = []
+    ordered_emotions = valid + others
+
+    # 書き込み処理（ordered_emotionsの長さ分だけ）
+    for rank, emo in enumerate(ordered_emotions):
+        if emo in df1.index:
+            df1.at[emo, vid_col] = score_map.get(rank, 0)
+
+    # appraisals 部分の処理
+    appraisals = raw_args1.get("appraisals", {})
+
+    VALUES = []
+    for app_name, value in appraisals.items():
+        if app_name in df3.index:
+            df3.at[app_name, vid_col] = value
+            VALUES.append(value)
+    now = datetime.now()
+    if "usage" in result1:
+        usage1 = result1["usage"]
+    if "prompt_tokens" in usage1:
+        token1 = usage1["prompt_tokens"]
+    else:
+        token1 = usage1["input_tokens"]
+    print(now.strftime("%H:%M"), f"/ {vid_idx} / {model}", "★EMO:", ordered_emotions,
+          "★ APP:", VALUES, token1, "tokens")
+
+    # csvに保存
+    df1.to_csv(file_path1, index=True, header=True)
+    df3.to_csv(file_path3, index=True, header=True)
+    if os.path.getsize(file_path1) == 0:
+        raise RuntimeError(f"CSV書き込みに失敗しました: {file_path1}")
+    if len(df1) < 34:
+        raise RuntimeError(
+            f"CSVが途中で欠落しています（{len(df1)} 行しかありません）: {file_path1}")
+    if os.path.getsize(file_path3) == 0:
+        raise RuntimeError(f"CSV書き込みに失敗しました: {file_path3}")
+    if len(df3) < 14:
+        raise RuntimeError(
+            f"CSVが途中で欠落しています（{len(df3)} 行しかありません）: {file_path3}")
+
+
+def fix_broken_json_array_text(text):
+    """
+    壊れた JSON 配列文字列を受け取り、
+    修正済みの JSON 文字列を返す。
+
+    例:
+      '["Abc", "Def", "Gh'
+    → '["Abc", "Def"]'
+    """
+    lst = fix_broken_json_array(text)
+    return json.dumps(lst, ensure_ascii=False)
+
+
+# 14. resultの形の確認
+def handle_api_result(result):
+    # 1) 型チェック
+    if not isinstance(result, dict):
+        logging.error(
+            f"❌ Unexpected API response type (not dict): {type(result)}")
+
+        return None
+
+    if "choices" in result and result["choices"]:
+        choice = result["choices"][0]
+        # Chat completions の場合、message は choice["message"]
+        msg = choice.get("message", {})
+        # 関数呼び出しが来ているか
+        if "function_call" in msg:
+            args_text = msg["function_call"].get("arguments", "")
+            try:
+                fixed_text = fix_broken_json_array_text(args_text)
+                args = json.loads(fixed_text)
+            except Exception:
+                print("\n★ 評価：なし")
+                return None
+            return {"mode": "function_call", "args": args}
+        # 通常のテキスト応答
+        if "content" in msg:
+            return {"mode": "message", "content": msg["content"]}
+        # 互換性のため、choice に直接 'text' がある場合も扱う
+        if "text" in choice:
+            return {"mode": "text", "content": choice["text"]}
+
+    # 3) output 形式（/v1/responses など）
+    if "output" in result and result["output"]:
+        # output は list のことが多い。中身を結合して扱う例：
+        outputs = result["output"]
+        # 例: outputs の中に {'type':'message','content':[{'type':'output_text','text':'...'}]} のような構造がある場合
+        # ここでは簡易に text を抽出する汎用ロジックを使う
+        texts = []
+        for item in outputs:
+            # item が dict で 'content' を持つ場合
+            if isinstance(item, dict):
+                # content が list の場合、その中の text を拾う
+                cont = item.get("content")
+                if isinstance(cont, list):
+                    for c in cont:
+                        if isinstance(c, dict) and "text" in c:
+                            texts.append(c["text"])
+                        elif isinstance(c, str):
+                            texts.append(c)
+                elif isinstance(cont, str):
+                    texts.append(cont)
+                # 直接 'text' キーがある場合
+                elif "text" in item:
+                    texts.append(item["text"])
+            if item.get("type") == "output_text":
+                content = item.get("content", [])
+                texts = []
+                for c in content:
+                    if isinstance(c, dict) and "text" in c:
+                        texts.append(c["text"])
+                if texts:
+                    return {"mode": "message", "content": "\n".join(texts)}
+        joined = "\n".join(texts).strip()
+        if joined:
+            return {"mode": "message", "content": joined}
+        # もし output に function_call 相当があるならその処理を追加（API仕様に依存）
+        # ここでは見つからなければエラー扱いにする
+    if item.get("type") == "reasoning":
+        # reasoning には text が無いので、summary を返すか None にする
+        summary = item.get("summary")
+        if summary:
+            texts.append("\n".join(summary))
+        return {"mode": "message", "content": "\n".join(texts)}
+
+    # 4) どちらの形式でもない場合はログ出力して None を返す
+    logging.error("❌ Unexpected API response structure. keys=%s; full=%s", list(
+        result.keys()), result)
+    return None
+
+# 15. API呼び出し(response, chat共通)
+
+
+def send_request(payload, vid_name, model):
+    # OpenAIのLLMに送るresponseを作成
+    URL_CHAT = "https://api.openai.com/v1/chat/completions"
+
+    try:
+        response = requests.post(
+            URL_CHAT,
+            headers={"Authorization": f"Bearer {UN_API_KEY}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=(5, 360)
+        )
+        response.raise_for_status()
+        return response
+
+    except requests.exceptions.ReadTimeout:
+        logging.warning("⌛️タイムアウト")
+
+        error_log.append(f"{vid_name} / {model} / TIMEOUT")
+        return None
+
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"⚠️ リクエストエラー")
+
+        error_log.append(f"{vid_name} / {model} / REQUEST")
+        if "429" in str(e) and "Too Many Requests" in str(e):
+            logging.warning("status code: 429 API使用制限 残量を追加してください。")
+            return "Too-Many-Requests"
+        else:
+            logging.warning(e)
+            return None
+
+# 17. jpgファイルをすべて読み込み
+
+
+def get_frame_urls(vid_idx, base_url, root="frames_resized"):
+    """
+    frames_resized/{vid_idx:04d}/ 内の画像ファイルをすべて読み込み、
+    ソートして URL を返す。
+    """
+    folder = f"{vid_idx:04d}"
+    dir_path = os.path.join(root, folder)
+
+    if not os.path.exists(dir_path):
+        return []  # 欠番は空リストで返す
+
+    # 対象拡張子
+    valid_ext = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+    # ファイル名をすべて取得してソート
+    files = sorted([
+        f for f in os.listdir(dir_path)
+        if f.lower().endswith(valid_ext)
+    ])
+
+    # URL を生成
+    urls = [f"{base_url}/{root}/{folder}/{fname}" for fname in files]
+
+    return urls
+
+# 19
+
+
+def process_video(model, vid_idx: int,  new_path1, new_path3) -> Optional[int]:
+    df21 = pd.read_csv(new_path1, index_col=0, encoding="shift_jis")
+    df23 = pd.read_csv(new_path3, index_col=0, encoding="shift_jis")
+    
+    # --- 再評価前に TEXT_1 の感情スコアをリセット ---
+    reset_column(df21, vid_idx)
+    df21.to_csv(new_path1, encoding="shift_jis")
+
+    vid_name = f"{vid_idx:04d}.mp4"
+
+    # --- フレーム解析(一部モデルのみ)
+    try:
+        # 画像バイト列を Base64 にエンコードして b64 に格納済みとする
+        result1 = []
+        result2 = []
+        response1 = []
+
+        text_path = f"./texts/{vid_idx:04d}.txt"
+        if os.path.exists(text_path):
+            with open(text_path, "r", encoding="utf-8") as f:
+                video_text = f.read()
+        else:
+            return None
+
+        with open("./emotions.json", "r", encoding="utf-8") as f:
+            emotions_data = json.load(f)
+        TEXT_INPUT_C = [
+            {
+                "role": "user", "content": [{"type": "text", "text": "The Video-specific prompt:"},
+                                            {"type": "text", "text": video_text}]
+            }
+        ]
+        WORDS_INPUT_C = [
+            {
+                "role": "user", "content": [
+                    {"type": "text", "text": "The 34 EMOTIONS are available below."},
+                    {"type": "text", "text": json.dumps(emotions_data)}]
+            }
+        ]
+
+        try:
+            if model in MODELS_OTHERS:
+                result2 = run_completions_session(
+                    SP0_INPUT_C, TEXT_INPUT_C+WORDS_INPUT_C, model, functions0, "return_emotions_appraisals")
+            if result1 == 429 or result2 == 429:
+                logging.warning(
+                    f"⚠️ status code: 429 API使用制限 残量を追加してください。")
+                return 0
+            if result1 == "Not 200" or result2 == "Not 200":
+                # エラー時の処理（スキップ、リトライなど）
+                return vid_idx
+        except json.JSONDecodeError:
+            logging.error("❌ API response could not be decoded as JSON.")
+            return vid_idx
+        except ValueError:
+            logging.info(result1.text)
+            return vid_idx
+        except Exception as e:
+            err = str(e)
+            logging.error(err)
+            return None
+
+        if result1 != []:
+            parsed1 = handle_api_result(result1)
+            if parsed1 is None:
+                return vid_idx
+        parsed2 = handle_api_result(result2)
+        if parsed2 is None:
+            return vid_idx
+            # --- 既存の処理 ---
+        emotion_word_appraisal(model, vid_idx,  result2, df21, df23,
+                               new_path1, new_path3)
+
+    except requests.HTTPError as http_err:
+        logging.error(
+            f"⚠️ HTTP error on {vid_name}: {http_err}")
+        if http_err.response.status_code != 200 and http_err.response.status_code != 429:
+            if response1:
+                logging.info(response1.text)
+            return vid_idx
+        if http_err.response.status_code == 429:
+            logging.warning(
+                "\n★API使用制限★")
+            return 0
+    except Exception as e:
+        logging.warning("Error:\n", e)
+        err = getattr(e, 'response', None) or {}
+        logging.error("Status: %s", getattr(err, "status_code", None))
+        return vid_idx
+    return vid_idx + 1
+
+# 　動画１つずつを、「completion フレームあり」「completion フレームなし」「response フレームあり」「response フレームなし」ごとにThread をつける
+
+
+def main():
+    indices = range(NUM_START, NUM_VIDS + 1)
+    for vid_idx in indices:
+        folder = f"./texts/{vid_idx:04d}.txt"
+        if not os.path.exists(folder):
+            continue
+
+        EVALUATIONS = get_pending_evaluations(vid_idx, day=Day)
+
+        if not EVALUATIONS:
+            continue
+        for model in EVALUATIONS:
+            # 新しい保存先
+            new_path1 = f"./モデル別ファイル/論文用/{model}/1227_{model}_TEXT_1.csv"
+            new_path3 = f"./モデル別ファイル/論文用/{model}/1227_{model}_TEXT_3.csv"
+            # あなたの既存の評価関数に model と inputting を渡す
+            a = process_video(model, vid_idx, new_path1, new_path3)
+            if a is None:
+                continue
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        tb_list = traceback.extract_tb(exc_tb)
+
+        import os
+        current_file = os.path.abspath(__file__)
+
+        # 自分のファイルのフレームだけを探す
+        user_tb = None
+        for tb in reversed(tb_list):
+            if os.path.abspath(tb.filename) == current_file:
+                user_tb = tb
+                break
+
+        if user_tb:
+            logging.error(f"{user_tb.lineno}行目:\n {exc_value}")
+        else:
+            # フォールバック
+            tb = tb_list[-1]
+            logging.error(f"{tb.lineno}行目:\n {exc_value}")

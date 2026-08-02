@@ -1,0 +1,999 @@
+import os
+import re
+import cv2
+import sys
+import glob
+import json
+import time
+import shutil
+import logging
+import requests
+import traceback
+import numpy as np
+import pandas as pd
+from typing import Optional
+from datetime import datetime
+from typing import List, Tuple
+
+# こちらのファイルをpythonファイルとして、Visual Studio Codeを用いて実行しました。
+
+# 1. パラメータ調整欄
+Day = "1227"
+temperature = 0
+NUM_START = 1
+NUM_VIDS = 2185
+
+# 2. APIキーなど、LLM関係の設定
+# APIキーは、この実験では大学から支給されたものを使用いたしました。
+API_KEY = ""
+headers = {"Authorization": f"Bearer {API_KEY}",
+           "Content-Type": "application/json"}
+
+MODELS_FRAMES = ["chatgpt-4o-latest",]
+                 #"gpt-5", "gpt-5.2-pro", "gpt-5.1-chat-latest",
+                 #"gpt-5.2-chat-latest", "gpt-5-mini", "gpt-5-nano"]  # response, 画像入力あり
+                 
+base_url = "https://pepedol-42965.ngrok.dev"
+
+# =============================================================
+# 1. 感情カテゴリ,14次元
+# =============================================================
+EMOTIONS = [
+    "Admiration", "Adoration", "Aesthetic-Appreciation", "Amusement", "Anger", "Anxiety",
+    "Awe", "Awkwardness", "Boredom", "Calmness", "Confusion", "Contempt", "Craving",
+    "Disappointment", "Disgust", "Empathic-Pain", "Entrancement", "Envy", "Excitement",
+    "Fear", "Guilt", "Horror", "Interest", "Joy", "Nostalgia", "Pride", "Relief", "Romance",
+    "Sadness", "Satisfaction", "Sexual-Desire", "Surprise", "Sympathy", "Triumph"
+]
+
+with open("./emotions.json", "r", encoding="utf-8") as f:
+    emotions_data = json.load(f)
+WORDS = [
+    {"type": "input_text", "text": "The 34 EMOTIONS are available below."},
+    {"type": "input_text", "text": json.dumps(emotions_data)}
+]
+WORDS_INPUT_R = list(WORDS)
+
+APPRAISALS = ["approach", "arousal", "attention", "certainty", "commitment", "control", "dominance",
+              "effort", "fairness", "identity", "obstruction", "safety", "upswing", "valence"]
+
+# =============================================================
+# 2. 点数の付け方：
+# 感情カテゴリは、1位を50点、2位を10点、3位を1点,。
+# 14次元は、1~9点。
+# 理由は1位感情をより詳しい単語に言い換え、それを発生させる事物を提示（いずれもJSON→CSV）
+#=============================================================
+system_prompt = """
+                You are a participant in an experiment in which participants watch a video.
+
+                Input:
+                - A sequence of images representing sampled frames from a video.
+                - Your task is to mentally reconstruct the most plausible continuous video content from these frames, and then evaluate the entire reconstructed video as if you had watched it.
+
+                Task:
+                1. Of the 34 predefined emotions, output 3 emotions a common person would feel when watching the entire reconstructed video, in order of strength.
+                2. Additionally, output the scores of the 14 predefined appraisal dimensions (valence, arousal, dominance, etc.) as integers from 1–9.
+
+                Assessment rules:
+                - Use the perspective of a general observer, without incorporating your own subjective views or the characteristics of your hypothetical audience or assuming specific values, culture, age, gender, etc.
+                - Make mechanical judgments based solely on the characteristics of the reconstructed video content inferred from the input images.
+                - Do NOT rely on personal preferences or imagined backstories beyond what is visually inferable.
+
+                Output format rules:
+                - The output MUST be a single valid JSON object.
+                - The JSON MUST include:
+                - "emotions": an array of exactly 3 strings, each chosen from the 34 predefined EMOTIONS.
+                - "appraisals": an object with the 14 predefined APPRAISALS as keys and integer scores as values.
+                - "reason": an object containing:
+                    - "top_emotion_words": an array of concrete words that express the strongest (1st-ranked) emotion.
+                    - "causes": an array of objects, people, events, or situations in the reconstructed video that contributed to that top emotion.
+
+                - Do NOT invent or paraphrase emotion or appraisal names. Only use the predefined lists.
+                - Do NOT include any other text, commentary, Markdown, or keys outside the JSON object.
+
+                Output format example:
+                {
+                "emotions": ["*", "*", "*"],
+                "appraisals": {
+                    "valence": *,
+                    "arousal": *,
+                    "dominance": *,
+                    "certainty": *,
+                    "effort": *,
+                    "attention": *,
+                    "commitment": *,
+                    "control": *,
+                    "fairness": *,
+                    "identity": *,
+                    "obstruction": *,
+                    "safety": *,
+                    "upswing": *,
+                    "approach": *
+                },
+                "reason": {
+                    "top_emotion_words": ["*", "*"],
+                    "causes": ["*", "*", "*"]
+                }
+                }
+        """
+SP0_INPUT_R = [{"type": "input_text", "text": system_prompt.strip()}]
+
+# =============================================================
+# 3. エラー発生箇所で書き込み
+# =============================================================
+ERROR_CSV_PATH = "ERROR.csv"
+
+
+def load_or_init_error_df(path=ERROR_CSV_PATH):
+    if os.path.exists(path):
+        df = pd.read_csv(path, index_col=0, encoding="shift_jis")
+        # Series で読まれてしまった場合に備えて DataFrame 化
+        if isinstance(df, pd.Series):
+            df = df.to_frame().T  # 1 行だけの DataFrame にする
+        return df.astype(int)
+    else:
+        # モデル名を行インデックスにした空 DataFrame
+        return pd.DataFrame(index=MODELS_FRAMES, dtype=int)
+
+
+# 起動時に一度だけロード
+error_df = load_or_init_error_df()
+
+
+def mark_error(model, vid_idx, path=ERROR_CSV_PATH):
+    global error_df
+
+    # 念のため毎回 DataFrame であることを保証
+    if not isinstance(error_df, pd.DataFrame):
+        error_df = load_or_init_error_df(path)
+
+    col = str(vid_idx)
+
+    # 列がなければ 0 で初期化
+    if col not in error_df.columns:
+        error_df[col] = 0
+
+    # 行（モデル名）がなければ追加
+    if model not in error_df.index:
+        error_df.loc[model] = 0
+
+    # エラーをマーク
+    error_df.at[model, col] = 1
+
+    # 保存
+    error_df.to_csv(path, encoding="shift_jis")
+
+def load_error_csv(path=ERROR_CSV_PATH):
+    return pd.read_csv(path, index_col=0, encoding="shift_jis")
+
+
+def mark_error(model, vid_idx, error_df, path=ERROR_CSV_PATH):
+    col = str(vid_idx)
+    if col not in error_df.columns:
+        error_df[col] = 0
+    error_df.at[model, col] = 1
+    error_df.to_csv(path, encoding="shift_jis")
+
+
+# =============================================================
+# 4. JSONパース
+# =============================================================
+def extract_appraisals(app_text):
+    """
+    壊れた JSON 風の appraisals ブロックから
+    key:value をすべて抽出して dict にする
+    """
+    pattern = r'"(.*?)"\s*:\s*([0-9]+)'
+    matches = re.findall(pattern, app_text)
+
+    return {key: int(value) for key, value in matches}
+
+
+def extract_parts_from_broken_json(raw_path):
+    """
+    壊れた JSON 風テキストから
+    emotions, appraisals, reason を安全に抽出する
+    """
+
+    """raw.txt の中から JSON 部分だけを抽出して dict で返す"""
+    with open(raw_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # --- emotions ---
+    emo_pattern = r'"emotions"\s*:\s*\[(.*?)\]'
+    emo_match = re.search(emo_pattern, text, re.DOTALL)
+    if emo_match:
+        emo_raw = "[" + emo_match.group(1) + "]"
+        emotions = json.loads(emo_raw)
+    else:
+        emotions = []
+
+    # --- appraisals ---
+    app_pattern = r'"appraisals"\s*:\s*\{(.*?)\}'
+    app_match = re.search(app_pattern, text, re.DOTALL)
+    if app_match:
+        app_raw = "{" + app_match.group(1) + "}"
+        appraisals = extract_appraisals(app_raw)
+    else:
+        appraisals = {}
+
+    # --- reason ---
+    pattern = r'"reason"\s*:\s*"(.*?)"'
+    reason_match = re.search(pattern, text, re.DOTALL)
+    if reason_match:
+        reason = reason_match.group(1)
+    else:
+        reason = ""
+
+    return emotions, appraisals, reason
+
+
+error_dir = "./モデル別ファイル/論文用/json_parse_errors"
+
+
+def extract_emotions(text):
+    pattern = r'"emotions"\s*:\s*\[(.*?)\]'
+    m = re.search(pattern, text, re.DOTALL)
+    if not m:
+        return []
+    raw = "[" + m.group(1) + "]"
+    return [e.strip().strip('"') for e in raw.strip("[]").split(",")]
+
+
+def extract_appraisals(text):
+    pattern = r'"appraisals"\s*:\s*\{(.*?)\}'
+    m = re.search(pattern, text, re.DOTALL)
+    if not m:
+        return {}
+    block = m.group(1)
+    kv_pattern = r'"(.*?)"\s*:\s*([0-9]+)'
+    return {k: int(v) for k, v in re.findall(kv_pattern, block)}
+
+
+def extract_reason(text):
+    pattern = r'"reason"\s*:\s*"([\s\S]*?)"(?=\s*[,\}])'
+    m = re.search(pattern, text)
+    return m.group(1) if m else ""
+
+
+def fix_broken_json_array(text):
+    """
+    途中で切れた JSON 配列を安全に修復する。
+    例: ["Abc", "Def", "Gh → ["Abc", "Def"]
+    """
+
+    # 配列の開始位置を探す
+    start = text.find("[")
+    if start == -1:
+        return []
+
+    # 配列部分を抽出
+    arr = text[start:]
+
+    # 末尾が ] で終わっていなければ閉じる
+    if not arr.strip().endswith("]"):
+        arr = arr.rstrip()  # 改行など除去
+        arr += "]"
+
+    # JSON としてパースを試みる
+    try:
+        return json.loads(arr)
+    except Exception:
+        # パース失敗 → 要素ごとに手動で修復
+        # "xxx" の形を正規表現で抽出
+        items = re.findall(r'"([^"]*)"', arr)
+
+        # 最後の要素が途中で切れている場合を除去
+        fixed = []
+        for item in items:
+            if "\n" in item or "\r" in item:
+                continue
+            fixed.append(item)
+
+        return fixed
+
+
+def repair_arguments_array(arg_str: str) -> str:
+    """
+    function_call.arguments の中の壊れた配列部分を修復する。
+    例: "calmness","clarity",,"clarity-of-spiritual-
+      → "calmness","clarity","clarity-of-spiritual-"
+    """
+
+    if not isinstance(arg_str, str):
+        return arg_str
+
+    s = arg_str.strip()
+
+    # 1) よくある壊れ方：",," → "," に修正
+    s = re.sub(r',\s*,', ',', s)
+
+    # 2) words が配列でなく文字列扱いになっている壊れ方を修正
+    #    {"words":"a","b","c"} → {"words":["a","b","c"]}
+    if '"words":"' in s and not '"words":[' in s:
+        s = s.replace('"words":"', '"words":["')
+        # 最後の " を ] に置換（壊れている場合は後で補完）
+        s = re.sub(r'"(\s*})', r'"]\1', s)
+
+    # 3) 配列の途中で切れている場合、末尾の壊れた部分を削る
+    s = re.sub(r'"([^"]*)$', r'"\1"', s)
+
+    # 4) 配列の閉じ括弧が欠けている場合に補完
+    if '"words":[' in s and not re.search(r'\]\s*}', s):
+        # words の後ろに ]} を補完
+        s = re.sub(r'\s*}$', ']}', s)
+
+    return s
+
+
+def fix_broken_json_array_text(text):
+    """
+    壊れた JSON 配列文字列を受け取り、
+    修正済みの JSON 文字列を返す。
+
+    例:
+      '["Abc", "Def", "Gh'
+    → '["Abc", "Def"]'
+    """
+    lst = fix_broken_json_array(text)
+    return json.dumps(lst, ensure_ascii=False)
+
+
+
+# =============================================================
+# 5. 入力
+# =============================================================
+
+def build_safe_content(vid_idx, base_url):
+    urls = get_frame_urls(vid_idx, base_url)
+
+    frame_blocks = [{"type": "input_text",
+                     "text": "All frames of this video follow."}]
+    frame_blocks += [
+        {"type": "input_image", "image_url": url}
+        for url in urls
+    ]
+
+    words_blocks = [
+        {"type": "input_text",
+            "text": "The 34 EMOTIONS and 14 APPRAISALS are defined as follows."},
+        {"type": "input_text", "text": json.dumps(emotions_data)}
+    ]
+
+    content = [
+        {"type": "input_text", "text": system_prompt},
+        *frame_blocks,
+        *words_blocks,
+    ]
+    return content
+
+
+
+def run_responses_session(model, vid_idx, base_url):
+    #動画を読み込み
+    url = "https://api.openai.com/v1/responses"
+
+    # 毎回「新しい list」として content を構築
+    content = build_safe_content(vid_idx, base_url)
+
+    # ここで ngrok チェック
+    content_str = json.dumps(content)
+    if "ngrok" not in content_str:
+        return "Not 200"
+
+    message_block = {
+        "type": "message",
+        "role": "user",
+        "content": content
+    }
+
+    payload = {
+        "model": model,
+        "max_output_tokens": 2000,
+        "input": [message_block],
+    }
+
+    if model in ["gpt-5", "gpt-5-mini", "gpt-5-nano"]:
+        payload["reasoning"] = {"effort": "low"}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload,
+                                 timeout=(5, 360))
+        response.raise_for_status()
+    except requests.exceptions.ReadTimeout:
+        return "Time-Out"
+    except requests.exceptions.RequestException as e:
+        if hasattr(e, "response") and e.response is not None and e.response.status_code == 429:
+            return 4290
+        else:
+            return "Not 200"
+
+    return response.json()
+
+
+# =============================================================
+# 6. 評価対象
+# =============================================================
+
+
+def normalize_col_name(x):
+    """
+    列名をどんな形式からでも「純粋な数字文字列」に正規化する。
+    """
+    if isinstance(x, int):
+        return str(x)
+
+    if not isinstance(x, str):
+        x = str(x)
+
+    # 前後の空白・タブ・不可視文字を除去
+    x = x.strip()
+
+    # BOM 除去
+    x = x.replace("\ufeff", "")
+
+    # 数字以外を除去（安全策）
+    x = "".join(ch for ch in x if ch.isdigit())
+
+    return x
+
+
+def needs_re_evaluation(csv_path: str, vid_idx: int) -> bool:
+    df = pd.read_csv(csv_path, index_col=0, encoding="shift_jis")
+
+    normalized_cols = {normalize_col_name(c): c for c in df.columns}
+    key = normalize_col_name(vid_idx)
+
+    if key not in normalized_cols:
+        return False
+
+    col = normalized_cols[key]
+    values = pd.to_numeric(df[col].iloc[0:34], errors="coerce").fillna(0)
+
+    s = values.sum()
+
+    # 正常パターン
+    NORMAL = {0, 50, 60, 61}
+
+    # 正常なら再評価しない
+    if s in NORMAL:
+        return False
+
+    # それ以外は異常 → 再評価
+    return True
+
+
+def get_pending_evaluations(vid_idx: int, day: str) -> List[Tuple[str, str]]:
+    EVALUATIONS: List[Tuple[str, str]] = []
+    for model in MODELS_FRAMES:
+        pattern = f"./モデル別ファイル/論文用/{model}/1227_{model}_FRAMES_1.csv"
+        old_files = glob.glob(pattern)
+
+        excel_path = old_files[0] if old_files else None
+
+        if excel_path is None:
+            # ファイルが無ければ未評価扱い
+            EVALUATIONS.append(model)
+        else:
+            try:
+                if needs_re_evaluation(excel_path, vid_idx):
+                    EVALUATIONS.append(model)
+            except Exception as e:
+                # 読み込みエラー等はログを残して未評価扱いにする
+                logging.error(f"Warning: failed to check {excel_path}: {e}")
+                EVALUATIONS.append(model)
+
+    return EVALUATIONS
+
+# =============================================================
+# 7. フレーム抽出
+# =============================================================
+
+def extract_frames_resize(video_path, vid_idx, out_root="all_frames", target_h=144, max_frames=10):
+    """
+    動きベースで代表フレームを最大 max_frames 枚だけ抽出する。
+    動きが少ない動画は 1〜2 枚、動きが激しい動画は最大 10 枚。
+    """
+
+    out_dir = os.path.join(out_root, f"{vid_idx:04d}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    diffs = []
+
+    # ---- 1. 全フレームを読み込む（縮小して軽量化） ----
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        h, w = frame.shape[:2]
+        scale = target_h / h
+        new_w = int(w * scale)
+        resized = cv2.resize(frame, (new_w, target_h))
+
+        frames.append(resized)
+
+    cap.release()
+
+    if len(frames) == 0:
+        return 0
+
+    # ---- 2. フレーム間差分（動き量）を計算 ----
+    gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
+
+    for i in range(len(gray_frames) - 1):
+        diff = cv2.absdiff(gray_frames[i], gray_frames[i+1])
+        diffs.append(np.sum(diff))  # 動き量のスカラー値
+
+    # ---- 3. 動きの大きいフレームを上位から選ぶ ----
+    if len(diffs) == 0:
+        selected_indices = [0]  # 1フレーム動画
+    else:
+        # 動き量の大きい順にソート
+        sorted_idx = np.argsort(diffs)[::-1]
+
+        # 最大 max_frames 枚
+        selected_indices = sorted_idx[:max_frames].tolist()
+
+        # diff は「i と i+1 の差」なので、フレーム番号は i+1 に対応
+        selected_indices = [i+1 for i in selected_indices]
+
+        # 0番目（最初のフレーム）は必ず入れる
+        if 0 not in selected_indices:
+            selected_indices.append(0)
+
+        # ソートしておく
+        selected_indices = sorted(set(selected_indices))
+
+    # ---- 4. 選ばれたフレームだけ保存 ----
+    for out_idx, frame_idx in enumerate(selected_indices):
+        out_path = os.path.join(out_dir, f"{out_idx:06d}.jpg")
+        cv2.imwrite(out_path, frames[frame_idx], [
+                    int(cv2.IMWRITE_JPEG_QUALITY), 50])
+        for _ in range(20):
+            try:
+                with open(out_path, "rb") as f:
+                    f.read(1)
+                break
+            except PermissionError:
+                time.sleep(0.05)
+
+    original_frame_count = len(frames)
+    selected_frame_count = len(selected_indices)
+
+    return original_frame_count, selected_frame_count
+
+
+def wait_until_frames_ready(vid_idx):
+    folder = f"./all_frames/{vid_idx:04d}"
+
+    # まず最初のフレームができるまで待つ
+    for _ in range(100):
+        if os.path.exists(os.path.join(folder, "000000.jpg")):
+            break
+        time.sleep(0.1)
+
+    # すべてのファイルが「読み込める状態」になるまで待つ
+    files = sorted(os.listdir(folder))
+    expected_last = int(files[-1].split(".")[0])
+
+    for _ in range(200):  # 最大20秒待つ
+        ok = True
+        for fname in files:
+            try:
+                with open(os.path.join(folder, fname), "rb") as f:
+                    f.read(1)
+            except PermissionError:
+                ok = False
+                break
+        if ok:
+            return
+        time.sleep(0.1)
+
+#削除
+def delete_frame_folder(vid_idx, root="all_frames"):
+    dir_path = os.path.join(root, f"{vid_idx:04d}")
+    if os.path.exists(dir_path):
+        shutil.rmtree(dir_path)
+
+
+# =============================================================
+# 8. 感情カテゴリ・次元・単語の保存
+# =============================================================
+
+def extract_results_as_choice(result):
+    # Responses API の output を探す
+    outputs = result.get("output", [])
+    for item in outputs:
+        if not isinstance(item, dict):
+            continue
+
+        # content がある message ブロックを探す
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+
+        # content の中に output_text があるか探す
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "output_text":
+                text = c.get("text", "")
+                # JSON 部分だけ抽出
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1:
+                    try:
+                        return json.loads(text[start:end+1])
+                    except:
+                        return None
+
+    # 見つからなければ None
+    return None
+
+
+def save_reason_csv(model, vid_idx, reason_obj):
+    """
+    reason の JSON を
+    行＝word1, word2, reason1, reason2...
+    列＝video_id
+    のワイド形式で保存する。
+    """
+
+    base_dir = "./モデル別ファイル/論文用/reason_csv"
+    os.makedirs(base_dir, exist_ok=True)
+
+    csv_path = os.path.join(base_dir, f"02_{model}_FRAMES_reason.csv")
+
+    # JSON から抽出
+    top_words = reason_obj.get("top_emotion_words", [])
+    causes = reason_obj.get("causes", [])
+
+    # ラベル付きで並べる
+    rows = {}
+    for i, w in enumerate(top_words, start=1):
+        rows[f"word{i}"] = w
+    for i, c in enumerate(causes, start=1):
+        rows[f"reason{i}"] = c
+
+    # 既存 CSV があれば読み込む
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path, index_col=0, encoding="utf-8")
+    else:
+        df = pd.DataFrame()
+
+    col = str(vid_idx)
+
+    # 新しい列がなければ追加
+    if col not in df.columns:
+        df[col] = ""
+
+    # 行を追加または更新
+    for row_label, text in rows.items():
+        df.loc[row_label, col] = text
+
+    # 保存
+    df.to_csv(csv_path, encoding="utf-8")
+
+    return top_words, causes
+
+
+
+def emotion_word_appraisal(model, vid_idx, API_raw_result, Emotions_path, Appraisals_path):
+    extracted_results = extract_results_as_choice(API_raw_result)
+    df_emotion_result = pd.read_csv(
+        Emotions_path, index_col=0, encoding="shift_jis")
+    df_Appraisals = pd.read_csv(
+        Appraisals_path, index_col=0, encoding="shift_jis")
+    if not extracted_results:
+        error_dir = "./モデル別ファイル/論文用/json_parse_errors"
+        os.makedirs(error_dir, exist_ok=True)
+
+        # 保存ファイル名
+        filename = f"{vid_idx}_{model}_FRAMES_raw.txt"
+        save_path = os.path.join(error_dir, filename)
+
+        # API_raw_result 全体を保存（壊れた JSON も含めて）
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(str(API_raw_result))
+
+        logging.error(
+            f"JSON parse error: Saved raw response to {save_path}")
+        #mark_error(model, vid_idx, error_df)
+        return None
+
+    # JSON文字列ならdictに変換
+    if isinstance(extracted_results, str):
+        extracted_results = json.loads(extracted_results)
+
+    # emotions 部分の処理
+    if isinstance(extracted_results, list):
+        extracted_results = extracted_results[0]
+
+    vid_col = str(vid_idx)
+    # 列が存在しなければ追加
+    if vid_col not in df_emotion_result.columns:
+        df_emotion_result[vid_col] = 0
+    if vid_col not in df_Appraisals.columns:
+        df_Appraisals[vid_col] = 1
+    emotions = extracted_results.get("emotions", [])
+
+    # 順位ごとの点数を定義
+    score_map = {0: 50, 1: 10, 2: 1}
+
+    # emotions の順位に応じてスコアを付与
+    # EMOTIONSにないものを"Other"に変換し、既存感情より後ろに配置
+    valid = [e for e in emotions if e in EMOTIONS]
+    if any(e not in EMOTIONS for e in emotions):
+        others = ["Other"]
+    else:
+        others = []
+    ordered_emotions = valid + others
+
+    # 書き込み処理（ordered_emotionsの長さ分だけ）
+    for rank, emo in enumerate(ordered_emotions):
+        if emo in df_emotion_result.index:
+            df_emotion_result.at[emo, vid_col] = score_map.get(rank, 0)
+
+    # appraisals 部分の処理
+    appraisals = extracted_results.get("appraisals", {})
+
+    VALUES = []
+    for app_name, value in appraisals.items():
+        if app_name in df_Appraisals.index:
+            df_Appraisals.at[app_name, vid_col] = value
+            VALUES.append(value)
+    now = datetime.now()
+    if "usage" in API_raw_result:
+        usage1 = API_raw_result["usage"]
+        if "prompt_tokens" in usage1:
+            token1 = usage1["prompt_tokens"]
+        else:
+            token1 = usage1["input_tokens"]
+        # reason の処理
+    reason_obj = extracted_results.get("reason", {})
+
+    # reason を CSV に保存
+    top_words, causes = save_reason_csv(model, vid_idx, reason_obj)
+
+    print(now.strftime("%H:%M"), f"/ {vid_idx} / {model}", ordered_emotions,
+          "\n", VALUES, top_words, causes, token1)
+    if token1 < 630:
+        return 4290
+    else:
+        # csvに保存
+        df_emotion_result.to_csv(Emotions_path, index=True, header=True)
+        df_Appraisals.to_csv(Appraisals_path, index=True, header=True)
+        if os.path.getsize(Emotions_path) == 0:
+            raise RuntimeError(f"CSV書き込みに失敗しました: {Emotions_path}")
+        if len(df_emotion_result) < 34:
+            raise RuntimeError(
+                f"CSVが途中で欠落しています（{len(df_emotion_result)} 行しかありません）: {Emotions_path}")
+        if os.path.getsize(Appraisals_path) == 0:
+            raise RuntimeError(f"CSV書き込みに失敗しました: {Appraisals_path}")
+        if len(df_Appraisals) < 14:
+            raise RuntimeError(
+                f"CSVが途中で欠落しています（{len(df_Appraisals)} 行しかありません）: {Appraisals_path}")
+
+
+
+# =============================================================
+# 9. resultの形の確認 形が合っていなければすべて評価後に別途パース
+# =============================================================
+
+def handle_api_result(result):
+    # 1) 型チェック
+    if not isinstance(result, dict):
+        return None
+
+    if "choices" in result and result["choices"]:
+        choice = result["choices"][0]
+        # Chat completions の場合、message は choice["message"]
+        msg = choice.get("message", {})
+        # 関数呼び出しが来ているか
+        if "function_call" in msg:
+            args_text = msg["function_call"].get("arguments", "")
+            try:
+                fixed_text = fix_broken_json_array_text(args_text)
+                args = json.loads(fixed_text)
+            except Exception:
+                return None
+            return {"mode": "function_call", "args": args}
+        # 通常のテキスト応答
+        if "content" in msg:
+            return {"mode": "message", "content": msg["content"]}
+        # 互換性のため、choice に直接 'text' がある場合も扱う
+        if "text" in choice:
+            return {"mode": "text", "content": choice["text"]}
+
+    # 3) output 形式（/v1/responses など）
+    if "output" in result and result["output"]:
+        # output は list のことが多い。中身を結合して扱う例：
+        outputs = result["output"]
+        # 例: outputs の中に {'type':'message','content':[{'type':'output_text','text':'...'}]} のような構造がある場合
+        # ここでは簡易に text を抽出する汎用ロジックを使う
+        texts = []
+        for item in outputs:
+            # item が dict で 'content' を持つ場合
+            if isinstance(item, dict):
+                # content が list の場合、その中の text を拾う
+                cont = item.get("content")
+                if isinstance(cont, list):
+                    for c in cont:
+                        if isinstance(c, dict) and "text" in c:
+                            texts.append(c["text"])
+                        elif isinstance(c, str):
+                            texts.append(c)
+                elif isinstance(cont, str):
+                    texts.append(cont)
+                # 直接 'text' キーがある場合
+                elif "text" in item:
+                    texts.append(item["text"])
+            if item.get("type") == "output_text":
+                content = item.get("content", [])
+                texts = []
+                for c in content:
+                    if isinstance(c, dict) and "text" in c:
+                        texts.append(c["text"])
+                if texts:
+                    return {"mode": "message", "content": "\n".join(texts)}
+        joined = "\n".join(texts).strip()
+        if joined:
+            return {"mode": "message", "content": joined}
+        # もし output に function_call 相当があるならその処理を追加（API仕様に依存）
+        # ここでは見つからなければエラー扱いにする
+    if item.get("type") == "reasoning":
+        # reasoning には text が無いので、summary を返すか None にする
+        summary = item.get("summary")
+        if summary:
+            texts.append("\n".join(summary))
+        return {"mode": "message", "content": "\n".join(texts)}
+
+    # 4) どちらの形式でもない場合はログ出力して None を返す
+    logging.error("❌ Unexpected API response structure. keys=%s; full=%s", list(
+        result.keys()), result)
+    return None
+
+
+# =============================================================
+# 10. jpgファイルをすべて読み込み
+# =============================================================
+def get_frame_urls(vid_idx, base_url, root="all_frames"):
+    """
+    all_frames/{vid_idx:04d}/ 内の画像ファイルをすべて読み込み、
+    ソートして URL を返す。
+    """
+    folder = f"{vid_idx:04d}"
+    dir_path = os.path.join(root, folder)
+
+    if not os.path.exists(dir_path):
+        return []  # 欠番は空リストで返す
+
+    # 対象拡張子
+    valid_ext = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+    # ファイル名をすべて取得してソート
+    files = sorted([
+        f for f in os.listdir(dir_path)
+        if f.lower().endswith(valid_ext)
+    ])
+
+    # URL を生成
+    urls = [f"{base_url}/{root}/{folder}/{fname}" for fname in files]
+
+    return urls
+
+# =============================================================
+# model, vid_idx,  Emotions_path, Appraisals_path
+# =============================================================
+def process_video(model, vid_idx: int,  Emotions_path, Appraisals_path) -> Optional[int]:
+    try:
+        # 1. API呼び出し
+        API_raw_result = run_responses_session(model, vid_idx, base_url)
+        if API_raw_result == 4290:
+            logging.error(f"⚠️ 429 API使用制限 ")
+            return 4290
+        if API_raw_result == "Not 200":
+            return None
+
+        #変換結果が正しいJSON形式になっているか確認。
+        JSON_result = handle_api_result(API_raw_result)
+        if JSON_result is None:
+            return vid_idx
+        #CSV保存
+        emotion_word_appraisal(model, vid_idx, API_raw_result, Emotions_path, Appraisals_path)
+        return vid_idx
+    except requests.HTTPError as http_err:
+        logging.error(
+            f"⚠️ HTTP error on {vid_idx}.mp4: {http_err}")
+        if http_err.response.status_code != 200 and http_err.response.status_code != 429:
+            return vid_idx
+        if http_err.response.status_code == 429:
+            logging.error(
+                "⚠️ 429 API使用制限 ")
+            return 4290
+    except Exception as e:
+        err = getattr(e, 'response', None) or {}
+        logging.error("Status: %s", getattr(err, "status_code", None))
+        return None
+    except json.JSONDecodeError:
+        logging.error("❌ API response could not be decoded as JSON.")
+        return None
+    except ValueError:
+        logging.info(API_raw_result.text)
+        return None
+    except Exception as e:
+        err = str(e)
+        logging.error(err)
+        return None
+    return None
+
+
+def main():
+    # ngrokエラーに備え、10回連続で評価
+    for i in range(0, 10):
+        indices = range(NUM_START, NUM_VIDS + 1)
+        for vid_idx in indices:
+            video_path = f"./mp4_noname/{vid_idx:04d}.mp4"
+            #video_path2 = f"./mp4_warning/{vid_idx:04d}.mp4"
+            if not os.path.exists(video_path) :#and not os.path.exists(video_path2):
+                continue
+            # 評価対象
+            EVALUATIONS = get_pending_evaluations(vid_idx, day=Day)
+            if not EVALUATIONS:
+                continue
+            # フレーム抽出
+            if os.path.exists(video_path):
+                original_frame_count, selected_frame_count = extract_frames_resize(video_path, vid_idx)
+            """if os.path.exists(video_path2):
+                original_frame_count, selected_frame_count = extract_frames_resize(
+                    video_path2, vid_idx)"""
+            wait_until_frames_ready(vid_idx)
+            print(vid_idx, selected_frame_count,
+                  "枚 / 全", original_frame_count, "枚")
+            for model in EVALUATIONS:
+                Emotions_path = f"./モデル別ファイル/論文用/{model}/1227_{model}_FRAMES_1.csv"
+                Appraisals_path = f"./モデル別ファイル/論文用/{model}/1227_{model}_FRAMES_3.csv"
+                a = process_video(model, vid_idx, Emotions_path, Appraisals_path)
+                if a is None:
+                    continue
+                if a == 4290:
+                    break
+        for model in MODELS_FRAMES:
+            Emotions_path = f"./モデル別ファイル/論文用/{model}/1227_{model}_FRAMES_1.csv"
+            new_path2 = f"./モデル別ファイル/バックアップ/{model}/1227_{model}_FRAMES_1.csv"
+            Appraisals_path = f"./モデル別ファイル/論文用/{model}/1227_{model}_FRAMES_3.csv"
+            new_path4 = f"./モデル別ファイル/バックアップ/{model}/1227_{model}_FRAMES_3.csv"
+            try:
+                # 2. ファイルをコピー（メタデータも含めてコピーする場合はshutil.copy2を使用）
+                shutil.copy2(Emotions_path, new_path2)
+                shutil.copy2(Appraisals_path, new_path4)
+            except FileNotFoundError:
+                logging.error(f"エラー: 元ファイルが見つかりません ({Emotions_path})")
+        for filename in os.listdir(error_dir):
+            if not filename.endswith("raw.txt"):
+                continue
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        tb_list = traceback.extract_tb(exc_tb)
+
+        import os
+        current_file = os.path.abspath(__file__)
+
+        # 自分のファイルのフレームだけを探す
+        user_tb = None
+        for tb in reversed(tb_list):
+            if os.path.abspath(tb.filename) == current_file:
+                user_tb = tb
+                break
+
+        if user_tb:
+            logging.error(f"{user_tb.lineno}行目:\n {exc_value}")
+        else:
+            # フォールバック
+            tb = tb_list[-1]
+            logging.error(f"{tb.lineno}行目:\n {exc_value}")
